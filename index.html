@@ -36,6 +36,7 @@
             position: absolute; top: 50%; left: 10%; right: 10%; height: 2px; background: red; 
             z-index: 10; box-shadow: 0 0 4px red; opacity: 0.7;
         }
+        #debug-log { font-size: 0.7rem; color: #888; height: 1.2em; overflow: hidden; }
 
         /* 独自モーダル */
         #custom-modal {
@@ -57,7 +58,7 @@
         .monster-card { width: 45%; text-align: center; transition: all 0.3s; }
         .monster-emoji { font-size: 3.5rem; display: block; filter: drop-shadow(0 5px 5px rgba(0,0,0,0.2)); }
         .monster-name { font-weight: bold; font-size: 0.8rem; margin-top: 5px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .monster-id { font-size: 0.6rem; color: #888; display: block; letter-spacing: -0.5px; } /* バーコードID表示 */
+        .monster-id { font-size: 0.6rem; color: #888; display: block; letter-spacing: -0.5px; }
         
         .hp-bar-container { width: 100%; height: 8px; background: #ddd; border-radius: 4px; margin-top: 5px; overflow: hidden; }
         .hp-bar { height: 100%; width: 100%; transition: width 0.5s; }
@@ -106,9 +107,10 @@
         <div id="camera-area">
             <div class="scan-guide"></div>
         </div>
+        <div id="debug-log">カメラ起動中...</div>
         <p style="font-size:0.8rem; color:#888;">
             バーコードを赤い線に合わせてください。<br>
-            ※同じバーコードからは必ず同じ魔物が生まれます
+            ※ピントが合うまで少し前後させてください
         </p>
     </div>
 
@@ -166,8 +168,9 @@ let pIndex = 0;
 let eIndex = 0;
 let scanCount = 0;
 let isProcessing = false;
+let lastScannedCode = ""; // 連続読み込み防止用の変数
 
-// === ユーティリティ: バーコードの数字から必ず同じ乱数シードを作る ===
+// === ユーティリティ ===
 function hashString(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -177,7 +180,6 @@ function hashString(str) {
     return Math.abs(hash);
 }
 
-// 決定論的乱数生成器 (同じシードなら必ず同じ結果を出す)
 class Random {
     constructor(seed) { this.seed = seed; }
     next() {
@@ -192,9 +194,6 @@ class Random {
 function generateMonster(barcodeData) {
     const seed = hashString(String(barcodeData));
     const rng = new Random(seed);
-    
-    // この時点で rng の結果は毎回固定されるため、
-    // 同じバーコードなら必ず同じ名前・強さになります。
     
     const type = rng.next() > 0.5 ? '物理' : '特殊';
     const emoji = rng.pick(EMOJIS);
@@ -222,7 +221,7 @@ function generateMonster(barcodeData) {
         name, emoji, hp, maxHp: hp,
         kp, kd, mp, md, sp,
         type, skillName,
-        id: barcodeData // バーコードの数字そのもの
+        id: barcodeData
     };
 }
 
@@ -230,6 +229,10 @@ function generateMonster(barcodeData) {
 function startScanning() {
     document.getElementById('start-screen').style.display = 'none';
     document.getElementById('scan-ui').style.display = 'block';
+    
+    // 変数リセット
+    isProcessing = false;
+    lastScannedCode = "";
 
     Quagga.init({
         inputStream : {
@@ -242,8 +245,15 @@ function startScanning() {
                 height: 320
             }
         },
-        decoder : { readers : ["ean_reader", "ean_8_reader"] },
-        locate: true
+        decoder : { 
+            readers : ["ean_reader", "ean_8_reader"] 
+        },
+        locate: true,
+        // パフォーマンス調整
+        locator: {
+            patchSize: "medium",
+            halfSample: true
+        }
     }, function(err) {
         if (err) {
             console.log(err);
@@ -251,28 +261,50 @@ function startScanning() {
             return;
         }
         Quagga.start();
+        document.getElementById('debug-log').innerText = "スキャン待機中...";
     });
 
     Quagga.onDetected(function(result) {
         if (isProcessing) return;
 
+        // 信頼度チェック (誤検知防止)
+        if (result.codeResult.confidence < 0.6) return;
+
         const code = result.codeResult.code;
         if(!code || !code.match(/^[0-9]+$/)) return;
 
+        // 連続読み取り防止：直前と全く同じコードなら無視（画面上でユーザーが動かしていない場合など）
+        if (code === lastScannedCode) {
+            return; 
+        }
+
+        // 既にチームにいるかチェック
         const alreadyScanned = playerTeam.some(m => m.id === code);
         if (alreadyScanned) {
+            // 一時的にロックしてユーザーに通知
             isProcessing = true;
+            lastScannedCode = code; // これを記録しないと永遠にアラートが出る
+            
             document.getElementById('camera-area').style.border = "4px solid orange";
+            document.getElementById('debug-log').innerText = "登録済み: " + code;
+            
+            // 1.5秒後に再びスキャン可能にする
             setTimeout(() => { 
                 document.getElementById('camera-area').style.border = "4px solid #333";
+                document.getElementById('debug-log').innerText = "スキャン待機中...";
                 isProcessing = false; 
-            }, 1000);
+                // lastScannedCode はクリアしない（同じものを連続でかざし続けている間は無視するため）
+            }, 1500);
             return;
         }
 
-        // 成功時の処理
+        // --- 新規読み取り成功 ---
         isProcessing = true;
+        lastScannedCode = code;
+        
         document.getElementById('camera-area').style.border = "4px solid #00FF00";
+        document.getElementById('debug-log').innerText = "検知: " + code;
+        
         addMonsterToTeam(code);
     });
 }
@@ -292,6 +324,7 @@ function addMonsterToTeam(data) {
 function closeModal() {
     document.getElementById('custom-modal').style.display = 'none';
     document.getElementById('camera-area').style.border = "4px solid #333";
+    document.getElementById('debug-log').innerText = "次のバーコードをどうぞ";
     
     if (scanCount >= 3) {
         Quagga.stop();
@@ -300,6 +333,8 @@ function closeModal() {
         const video = document.querySelector('video');
         if (video) video.play();
         isProcessing = false;
+        // モーダルを閉じたタイミングでは lastScannedCode はクリアせず維持する
+        // (閉じた直後にまだカメラの前に同じ商品がある場合、即座に反応するのを防ぐため)
     }
 }
 
@@ -314,7 +349,6 @@ function initBattle() {
     document.getElementById('scan-ui').style.display = 'none';
     document.getElementById('battle-ui').style.display = 'block';
     
-    // 敵チームは毎回ランダム（飽きないように）
     for(let i=0; i<3; i++) {
         enemyTeam.push(generateMonster("enemy" + i + Math.random()));
     }
@@ -329,21 +363,18 @@ function initBattle() {
 }
 
 function resetGame() {
-    // リセット処理
     playerTeam = [];
     enemyTeam = [];
     pIndex = 0;
     eIndex = 0;
     scanCount = 0;
     isProcessing = false;
+    lastScannedCode = ""; // リセット時は履歴も消去
+    
     document.getElementById('log-box').innerHTML = "";
     document.getElementById('scan-count').innerText = "0";
-    
-    // 画面切り替え
     document.getElementById('battle-ui').style.display = 'none';
     document.getElementById('start-screen').style.display = 'block';
-    
-    // Quaggaはstopしているので、startScanning()で再初期化される
 }
 
 function updateBenchUI() {
@@ -364,12 +395,12 @@ function updateBattleUI() {
     const em = enemyTeam[eIndex];
     
     document.getElementById('p-name').innerText = pm.name;
-    document.getElementById('p-id').innerText = `No.${pm.id}`; // ID表示
+    document.getElementById('p-id').innerText = `No.${pm.id}`;
     document.getElementById('p-emoji').innerText = pm.emoji;
     document.getElementById('p-hp-bar').style.width = (pm.hp / pm.maxHp * 100) + "%";
     
     document.getElementById('e-name').innerText = em.name;
-    document.getElementById('e-id').innerText = "CPU"; // ID表示
+    document.getElementById('e-id').innerText = "CPU";
     document.getElementById('e-emoji').innerText = em.emoji;
     document.getElementById('e-hp-bar').style.width = (em.hp / em.maxHp * 100) + "%";
 }
@@ -384,7 +415,7 @@ function calcDamage(attacker, defender) {
     let damage = 0;
     if (attacker.type === '物理') {
         let base = (attacker.kp * 0.8) - (defender.kd * 0.2);
-        damage = Math.floor(base + (Math.random() * 10)); // ダメージ幅はランダム
+        damage = Math.floor(base + (Math.random() * 10));
     } else {
         let base = (attacker.mp * 0.8) - (defender.md * 0.2);
         damage = Math.floor(base + (Math.random() * 10));
@@ -398,7 +429,6 @@ function nextTurn() {
     
     if (pIndex >= 3 || eIndex >= 3) return;
 
-    // 交代処理
     if (pm.hp <= 0) {
         pIndex++;
         if (pIndex >= 3) { 
@@ -422,7 +452,6 @@ function nextTurn() {
         return;
     }
 
-    // 攻撃処理
     let first = pm.sp >= em.sp ? pm : em;
     let second = pm.sp >= em.sp ? em : pm;
     let isPlayerFirst = pm === first;
